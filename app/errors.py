@@ -1,6 +1,6 @@
 """领域错误定义。
 
-所有领域错误最终都以 HTTP 422 返回，响应体为::
+除别名绑定冲突（HTTP 409）外，所有领域错误最终都以 HTTP 422 返回，响应体为::
 
     {"detail": {"error": "<错误码>", "message": "<人类可读信息>"}}
 """
@@ -14,6 +14,21 @@ class ConversionError(Exception):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         self.message = message
+        super().__init__(message)
+
+
+class AliasConflictError(Exception):
+    """别名绑定的比较并交换（compare-and-swap）冲突（一律映射为 HTTP 409）。
+
+    当前指向与调用方提交的 ``expected_id`` 不一致时抛出；响应体同样为
+    ``{"detail": {"error", "message"}}``，并附带当前实际指向便于调用方重试。
+    """
+
+    def __init__(self, code: str, message: str, current_id: str | None) -> None:
+        self.code = code
+        self.message = message
+        #: 冲突时别名的当前实际指向（未绑定时为 None）
+        self.current_id = current_id
         super().__init__(message)
 
 
