@@ -1,9 +1,21 @@
-"""已发布的自定义单位定义集（custom unit sets）。
+"""已发布的自定义单位定义集（custom unit sets）与活动别名（active aliases）。
 
 通过 ``POST /custom-unit-sets`` 把一组（1～6 项）已经按现有规则校验并展开
 通过的自定义单位定义**发布**为可复用的定义集：服务生成不可猜测的标识，
 定义内容落盘保存且**不可修改**；后续 ``/convert``、``/evaluate``、``/solve``
 可凭标识选用该组定义。
+
+此外，已发布的定义集之上可以建立**活动别名**：调用方沿用同一个别名，
+维护者通过 ``PUT /custom-unit-set-aliases/{alias}`` 把别名切换到新的不可变
+定义集。切换采用乐观并发（expected_id）：
+
+- 仅当别名当前指向与提交的 ``expected_id`` 一致时才生效（初建别名时
+  ``expected_id`` 必须为 ``null``），否则返回 409 且**不改写原指向**；
+- 目标定义集不存在时返回 422，同样不改变任何指向；
+- 切换与落盘在同一把锁内共同生效：写盘失败时进程内指向保持原值
+  （异常时回滚），不会出现“内存已切换、磁盘未切换”的中间状态；
+- 别名与定义集保存在同一个 JSON 文件中，容器重建/进程重启后仍然有效；
+  旧文件没有别名字段时按空别名加载，已发布定义集照常可用。
 
 设计要点：
 
@@ -11,22 +23,27 @@
   （与请求内 ``custom_units`` 完全相同的规则），任一条目非法则不写入任何文件；
 - 存储为数据目录下的单个 JSON 文件，写入采用“临时文件 + 原子替换”，
   容器重建/进程重启后重新加载，已发布内容保持可用；
-- 已发布内容不可变：只提供发布与读取，没有更新/删除接口；
-- 并发安全：所有读写由同一把可重入锁串行化；请求级换算仍构造独立的
-  :class:`~app.custom_units.UnitScope`，互不共享、不修改全局单位表。
+- 已发布内容不可变：只提供发布、读取与别名切换，没有更新/删除接口；
+- 并发安全：所有读写由同一把可重入锁串行化；别名解析在请求开始时
+  **一次性快照**当前指向，之后整个请求（源、目标及变量单位）都使用
+  解析出的同一份定义——切换与计算并发时，单次请求只能完整使用旧版或
+  新版，不会跨版本混用；
+- 请求级换算仍构造独立的 :class:`~app.custom_units.UnitScope`，
+  互不共享、不修改全局单位表。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import threading
 from fractions import Fraction
 
 from .config import DATA_DIR
 from .custom_units import CustomUnitSpec, UnitScope
-from .errors import ConversionError
+from .errors import AliasConflictError, ConversionError
 from .schemas import CustomUnitItem
 
 #: 持久化文件名（位于 :data:`~app.config.DATA_DIR` 下）。
@@ -38,6 +55,10 @@ _ID_BYTES = 16
 
 #: 存储文件格式版本。
 _STORE_VERSION = 1
+
+#: 活动别名的词法：字母/数字/下划线/连字符，1～64 字符（与路径段兼容，
+#: 不会与定义集标识 ``cus_...`` 所在的命名空间冲突）。
+ALIAS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def invalid_request(message: str) -> ConversionError:
@@ -54,8 +75,33 @@ def unit_set_not_found(set_id: str) -> ConversionError:
     )
 
 
+def alias_target_not_found(alias: str, set_id: str) -> ConversionError:
+    """别名切换的目标定义集不存在（HTTP 422，不改变任何指向）。"""
+
+    return ConversionError(
+        "invalid_request",
+        f"别名 {alias!r} 无法绑定到不存在的定义集: {set_id!r}",
+    )
+
+
+def alias_not_found(alias: str) -> ConversionError:
+    """引用/查询的活动别名不存在（HTTP 422）。"""
+
+    return ConversionError("invalid_request", f"活动别名不存在: {alias!r}")
+
+
+def invalid_alias_name(alias: str) -> ConversionError:
+    """别名名称不合法（HTTP 422）。"""
+
+    return ConversionError(
+        "invalid_request",
+        f"别名 {alias!r} 不合法：仅允许字母、数字、下划线与连字符，"
+        "长度 1～64",
+    )
+
+
 class UnitSetStore:
-    """已发布定义集的持久化存储（线程安全、原子落盘）。"""
+    """已发布定义集与活动别名的持久化存储（线程安全、原子落盘）。"""
 
     def __init__(self, data_dir: str = DATA_DIR) -> None:
         self._data_dir = data_dir
@@ -63,6 +109,8 @@ class UnitSetStore:
         self._lock = threading.RLock()
         #: 标识 -> 已校验的定义项（按声明顺序）
         self._sets: dict[str, tuple[CustomUnitItem, ...]] = {}
+        #: 活动别名 -> 当前指向的定义集标识（不可变定义集的引用）
+        self._aliases: dict[str, str] = {}
         self._loaded = False
 
     @property
@@ -72,14 +120,17 @@ class UnitSetStore:
         return self._path
 
     def load(self) -> None:
-        """从数据目录加载已发布的定义集；文件不存在时以空存储启动。
+        """从数据目录加载已发布的定义集与活动别名；文件不存在时以空存储启动。
 
         文件存在但无法解析时抛出异常使启动失败（宁可不可用也不静默丢数据）。
+        旧版本文件可能没有 ``aliases`` 字段：此时按空别名加载，已发布的
+        定义集照常可用（向前兼容）。
         """
 
         with self._lock:
             if not os.path.exists(self._path):
                 self._sets = {}
+                self._aliases = {}
                 self._loaded = True
                 return
             with open(self._path, encoding="utf-8") as f:
@@ -91,7 +142,21 @@ class UnitSetStore:
                 sets[set_id] = tuple(
                     CustomUnitItem.model_validate(item) for item in items
                 )
+            aliases_raw = raw.get("aliases", {})
+            if not isinstance(aliases_raw, dict) or not all(
+                isinstance(name, str) and isinstance(target, str)
+                for name, target in aliases_raw.items()
+            ):
+                raise ValueError(
+                    f"自定义单位定义集存储文件的 aliases 字段格式非法: {self._path}"
+                )
+            # 只保留指向已存在定义集的别名：定义集不可删除，正常情况下不会
+            # 出现悬空引用；若文件被外部破坏则丢弃悬空项而非启动失败。
+            aliases = {
+                name: target for name, target in aliases_raw.items() if target in sets
+            }
             self._sets = sets
+            self._aliases = aliases
             self._loaded = True
 
     def publish(self, items: list[CustomUnitItem]) -> str:
@@ -147,6 +212,74 @@ class UnitSetStore:
         ]
         return UnitScope(specs)
 
+    # -- 活动别名 ---------------------------------------------------------
+
+    def list_aliases(self) -> dict[str, str]:
+        """返回全部活动别名及其当前指向（按别名排序的副本）。"""
+
+        self._ensure_loaded()
+        with self._lock:
+            return dict(sorted(self._aliases.items()))
+
+    def get_alias(self, alias: str) -> str:
+        """查询别名当前指向的定义集标识；别名不存在时抛出 422。"""
+
+        self._ensure_loaded()
+        with self._lock:
+            target = self._aliases.get(alias)
+        if target is None:
+            raise alias_not_found(alias)
+        return target
+
+    def bind_alias(
+        self, alias: str, target_set_id: str, expected_id: str | None
+    ) -> str:
+        """把活动别名切换（或初建）到目标定义集——乐观并发（CAS）。
+
+        - 别名名称不合法或目标定义集不存在：抛出 422，**不改变任何指向**；
+        - 当前指向与 ``expected_id`` 不一致（初建须为 ``None``）：抛出 409
+          :class:`~app.errors.AliasConflictError`，同样不改写原指向；
+        - 切换与落盘在同一把锁内共同生效：先在内存中改指向，再原子写盘；
+          写盘失败时回滚内存中的改动后重新抛出，进程内指向保持原值。
+        """
+
+        self._ensure_loaded()
+        if not ALIAS_NAME_RE.match(alias):
+            raise invalid_alias_name(alias)
+        with self._lock:
+            # 目标必须存在；先于 CAS 判定（任何情况下都不得改写原指向）
+            if target_set_id not in self._sets:
+                raise alias_target_not_found(alias, target_set_id)
+            current = self._aliases.get(alias)
+            if current != expected_id:
+                raise AliasConflictError(alias, current, expected_id)
+            if current == target_set_id:
+                # 指向未变（幂等重放）：无需写盘
+                return target_set_id
+            previous = current
+            self._aliases[alias] = target_set_id
+            try:
+                self._persist_locked()
+            except Exception:
+                # 写盘失败：回滚内存指向，切换与落盘必须共同生效
+                if previous is None:
+                    del self._aliases[alias]
+                else:
+                    self._aliases[alias] = previous
+                raise
+            return target_set_id
+
+    def build_scope_for_alias(self, alias: str) -> UnitScope:
+        """按活动别名当前指向的定义集构造一次独立的请求级解析上下文。
+
+        请求开始时调用一次：先在锁内快照别名当前指向的标识，再加载对应
+        定义。此后整个请求只使用该快照——即使别名在请求处理中被切换，
+        本次请求也会完整使用旧版或新版定义，不会跨版本混用。
+        别名不存在时抛出 422。
+        """
+
+        return self.build_scope(self.get_alias(alias))
+
     def count(self) -> int:
         """已发布的定义集数量（主要供测试与运维观察）。"""
 
@@ -161,7 +294,7 @@ class UnitSetStore:
             self.load()
 
     def _persist_locked(self) -> None:
-        """把当前定义集全量写入临时文件并原子替换（调用方须持锁）。"""
+        """把当前定义集与别名全量写入临时文件并原子替换（调用方须持锁）。"""
 
         os.makedirs(self._data_dir, exist_ok=True)
         payload = {
@@ -177,6 +310,7 @@ class UnitSetStore:
                 ]
                 for set_id, items in self._sets.items()
             },
+            "aliases": dict(sorted(self._aliases.items())),
         }
         tmp_path = f"{self._path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
         with open(tmp_path, "w", encoding="utf-8") as f:

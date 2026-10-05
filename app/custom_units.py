@@ -159,6 +159,7 @@ def build_scope(items: Iterable[CustomUnitSpec] | None) -> UnitScope | None:
 def scope_for_request(
     custom_units: Iterable[CustomUnitSpec] | None,
     custom_unit_set_id: str | None = None,
+    custom_unit_set_alias: str | None = None,
     *,
     store: "UnitSetStore | None" = None,
 ) -> UnitScope | None:
@@ -167,18 +168,24 @@ def scope_for_request(
     - 携带请求内 ``custom_units``：按原有规则就地构造（仅本次请求有效）；
     - 携带 ``custom_unit_set_id``：加载对应**已发布**定义集；标识不存在时
       抛出 422；
-    - 二者都缺省：返回 ``None``，三个接口保持原有行为。
+    - 携带 ``custom_unit_set_alias``：在请求开始时**解析一次**活动别名当前
+      指向的定义集，随后整个请求（源、目标及变量单位）都使用该份定义；
+      别名不存在时抛出 422。别名在请求处理中即使被切换，本次请求仍完整
+      使用解析时的旧版或新版，不会跨版本混用；
+    - 三者都缺省：返回 ``None``，三个接口保持原有行为。
 
-    ``custom_units`` 与 ``custom_unit_set_id`` 同时出现由 schema 层
+    三种来源两两互斥，同时出现由 schema 层
     （:class:`~app.schemas.CustomUnitsSelectionModel`）先行拒绝为 422。
     每次调用都返回独立的 :class:`UnitScope`，不同请求（含并发）互不污染。
     """
 
     if custom_units is not None:
         return build_scope(custom_units)
-    if custom_unit_set_id is not None:
+    if custom_unit_set_id is not None or custom_unit_set_alias is not None:
         from .unit_sets import UnitSetStore, get_store
 
         chosen: UnitSetStore = store or get_store()
+        if custom_unit_set_alias is not None:
+            return chosen.build_scope_for_alias(custom_unit_set_alias)
         return chosen.build_scope(custom_unit_set_id)
     return None

@@ -17,10 +17,11 @@ from .converter import (
     to_decimal_str,
 )
 from .custom_units import scope_for_request
-from .errors import ConversionError, affine_mixing
+from .errors import AliasConflictError, ConversionError, affine_mixing
 from .evaluator import evaluate, make_quantity
 from .parser import ParsedExpression, canonical, canonical_dim, parse_expression
 from .schemas import (
+    BindUnitSetAliasRequest,
     ConvertRequest,
     ConvertResponse,
     ErrorResponse,
@@ -28,6 +29,8 @@ from .schemas import (
     PublishUnitSetRequest,
     PublishedUnitSetResponse,
     SolveRequest,
+    UnitSetAliasInfo,
+    UnitSetAliasListResponse,
 )
 from .solver import solve
 from .unit_sets import get_store
@@ -68,6 +71,15 @@ async def conversion_error_handler(_: Request, exc: ConversionError) -> JSONResp
         status_code=422,
         content={"detail": {"error": exc.code, "message": exc.message}},
     )
+
+
+@app.exception_handler(AliasConflictError)
+async def alias_conflict_error_handler(_: Request, exc: AliasConflictError) -> JSONResponse:
+    # 乐观切换冲突：当前指向与 expected_id 不一致；不改变任何指向
+    detail: dict = {"error": "alias_conflict", "message": exc.message}
+    if exc.current_id is not None:
+        detail["current_id"] = exc.current_id
+    return JSONResponse(status_code=409, content={"detail": detail})
 
 
 @app.exception_handler(RequestValidationError)
@@ -112,6 +124,53 @@ def publish_unit_set_endpoint(req: PublishUnitSetRequest) -> PublishedUnitSetRes
     )
 
 
+@app.get(
+    "/custom-unit-set-aliases",
+    response_model=UnitSetAliasListResponse,
+    summary="查询全部活动别名及其当前指向的定义集",
+)
+def list_unit_set_aliases_endpoint() -> UnitSetAliasListResponse:
+    aliases = get_store().list_aliases()
+    return UnitSetAliasListResponse(
+        aliases=[
+            UnitSetAliasInfo(alias=alias, custom_unit_set_id=target)
+            for alias, target in aliases.items()
+        ]
+    )
+
+
+@app.get(
+    "/custom-unit-set-aliases/{alias}",
+    response_model=UnitSetAliasInfo,
+    responses={422: {"model": ErrorResponse, "description": "别名不存在"}},
+    summary="查询单个活动别名当前指向的定义集",
+)
+def get_unit_set_alias_endpoint(alias: str) -> UnitSetAliasInfo:
+    return UnitSetAliasInfo(
+        alias=alias, custom_unit_set_id=get_store().get_alias(alias)
+    )
+
+
+@app.put(
+    "/custom-unit-set-aliases/{alias}",
+    response_model=UnitSetAliasInfo,
+    responses={
+        409: {"description": "当前指向与 expected_id 不一致，未切换"},
+        422: {"model": ErrorResponse, "description": "目标定义集不存在或别名非法，未切换"},
+    },
+    summary="创建/切换活动别名（乐观并发：expected_id）",
+)
+def bind_unit_set_alias_endpoint(
+    alias: str, req: BindUnitSetAliasRequest
+) -> UnitSetAliasInfo:
+    # 仅当当前指向与 expected_id 一致时生效（初建须为 null）；
+    # 目标不存在返回 422；切换与落盘共同生效，失败不改写原指向。
+    target = get_store().bind_alias(
+        alias, req.custom_unit_set_id, req.expected_id
+    )
+    return UnitSetAliasInfo(alias=alias, custom_unit_set_id=target)
+
+
 @app.post(
     "/convert",
     response_model=ConvertResponse,
@@ -119,7 +178,9 @@ def publish_unit_set_endpoint(req: PublishUnitSetRequest) -> PublishedUnitSetRes
     summary="单位换算",
 )
 def convert_endpoint(req: ConvertRequest) -> ConvertResponse:
-    scope = scope_for_request(req.custom_units, req.custom_unit_set_id)
+    scope = scope_for_request(
+        req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
+    )
     src = parse_expression(req.from_unit, scope)
     dst = parse_expression(req.to_unit, scope)
     value = convert(req.value, src, dst)
@@ -137,7 +198,9 @@ def convert_endpoint(req: ConvertRequest) -> ConvertResponse:
     summary="带单位的变量公式求值并换算到目标单位",
 )
 def evaluate_endpoint(req: EvaluateRequest) -> ConvertResponse:
-    scope = scope_for_request(req.custom_units, req.custom_unit_set_id)
+    scope = scope_for_request(
+        req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
+    )
     # 变量先解析单位并折叠为 SI 口径的精确量；未知单位在此即报 422
     quantities = {
         name: make_quantity(var.value, parse_expression(var.unit, scope))
@@ -174,7 +237,9 @@ def evaluate_endpoint(req: EvaluateRequest) -> ConvertResponse:
     summary="用带单位的等式反求一个未知量",
 )
 def solve_endpoint(req: SolveRequest) -> ConvertResponse:
-    scope = scope_for_request(req.custom_units, req.custom_unit_set_id)
+    scope = scope_for_request(
+        req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
+    )
     # 变量先解析单位并折叠为 SI 口径的精确量；未知单位在此即报 422
     quantities = {
         name: make_quantity(var.value, parse_expression(var.unit, scope))

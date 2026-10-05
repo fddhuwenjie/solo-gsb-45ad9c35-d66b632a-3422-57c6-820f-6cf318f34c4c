@@ -59,12 +59,17 @@ class CustomUnitItem(BaseModel):
 CustomUnits = list[CustomUnitItem]
 
 
+#: 活动别名（custom unit set alias）的词法：与 unit_sets.ALIAS_NAME_RE 一致。
+ALIAS_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
+
+
 class CustomUnitsSelectionModel(BaseModel):
     """三个换算接口共用的自定义单位来源选择。
 
-    自定义单位可以来自请求内的 ``custom_units``（仅本次请求有效），也可以来自
-    已发布的定义集标识 ``custom_unit_set_id``；二者互斥，同时出现整次返回 422。
-    二者都缺省时三个接口保持原有行为。
+    自定义单位可以来自请求内的 ``custom_units``（仅本次请求有效）、已发布的
+    定义集标识 ``custom_unit_set_id``，或活动别名 ``custom_unit_set_alias``
+    （请求开始时解析一次，解析到哪一版就整次请求使用哪一版）。三者两两互斥，
+    同时出现整次返回 422；都缺省时三个接口保持原有行为。
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -74,22 +79,40 @@ class CustomUnitsSelectionModel(BaseModel):
         min_length=1,
         max_length=6,
         description="请求级自定义线性单位声明（1～6 项），仅在本次请求内有效；"
-        "与 custom_unit_set_id 互斥",
+        "与 custom_unit_set_id、custom_unit_set_alias 互斥",
     )
     custom_unit_set_id: str | None = Field(
         default=None,
         min_length=1,
         max_length=64,
-        description="已发布自定义单位定义集的服务端标识；与 custom_units 互斥，"
-        "标识不存在时整次请求返回 422",
+        description="已发布自定义单位定义集的服务端标识；与 custom_units、"
+        "custom_unit_set_alias 互斥，标识不存在时整次请求返回 422",
+    )
+    custom_unit_set_alias: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=ALIAS_NAME_PATTERN,
+        description="已发布定义集的活动别名；请求开始时解析一次，源、目标及"
+        "变量单位始终使用解析到的该版定义；与 custom_units、"
+        "custom_unit_set_id 互斥，别名不存在时整次请求返回 422",
     )
 
     @model_validator(mode="after")
     def _check_custom_units_sources_exclusive(self) -> "CustomUnitsSelectionModel":
-        if self.custom_units is not None and self.custom_unit_set_id is not None:
+        chosen = [
+            name
+            for name in (
+                "custom_units",
+                "custom_unit_set_id",
+                "custom_unit_set_alias",
+            )
+            if getattr(self, name) is not None
+        ]
+        if len(chosen) > 1:
             raise ValueError(
-                "custom_units 与 custom_unit_set_id 不能同时出现："
-                "一次调用只能选用一种自定义单位来源"
+                "、".join(chosen)
+                + " 不能同时出现：一次调用只能选用一种自定义单位来源"
             )
         return self
 
@@ -243,6 +266,37 @@ class PublishedUnitSetResponse(BaseModel):
     id: str = Field(description="服务生成的定义集标识（不可猜测；已发布内容不可修改）")
     custom_units: list[PublishedCustomUnitItem] = Field(
         description="已发布的定义项（factor 回显为精确十进制字符串），顺序与提交一致"
+    )
+
+
+class BindUnitSetAliasRequest(BaseModel):
+    """PUT /custom-unit-set-aliases/{alias} 请求体。"""
+
+    custom_unit_set_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="别名要指向的已发布定义集标识；不存在时返回 422 且不改变指向",
+    )
+    expected_id: str | None = Field(
+        description="乐观并发：调用方认为别名当前指向的标识；初建别名时必须为 "
+        "null。仅当当前指向与此一致时切换才生效，否则返回 409",
+    )
+
+
+class UnitSetAliasInfo(BaseModel):
+    """单个活动别名的当前状态。"""
+
+    alias: str = Field(description="活动别名（调用方长期沿用的名称）")
+    custom_unit_set_id: str = Field(
+        description="当前指向的已发布定义集标识（不可变定义集的引用）"
+    )
+
+
+class UnitSetAliasListResponse(BaseModel):
+    """GET /custom-unit-set-aliases 的成功响应。"""
+
+    aliases: list[UnitSetAliasInfo] = Field(
+        description="全部活动别名及其当前指向（按别名排序）"
     )
 
 

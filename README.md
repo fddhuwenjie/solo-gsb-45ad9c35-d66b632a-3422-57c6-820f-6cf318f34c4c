@@ -15,6 +15,7 @@
 - **精确十进制**：内部使用有理数精确运算；结果不能表示为有限十进制或超过精度上限时返回 422，绝不输出舍入值
 - **请求级自定义单位**：三个接口均可携带 1～6 项 `custom_units`（`symbol`/正十进制 `factor`/`base_unit`，含义为 `1 symbol = factor 个 base_unit`），支持前向引用与链式定义；自定义符号不与内置单位/词头冲突、不自动获得词头、不能引用 `degC`/`degF`/裸 `K`，且仅在本次请求内有效（不修改全局单位表，并发安全）
 - **可复用定义集发布（`POST /custom-unit-sets`）**：把 1～6 项已按上述规则校验并展开的定义发布为**可复用定义集**，服务生成不可猜测的标识；已发布内容不可修改，三个接口可凭 `custom_unit_set_id` 选用（与请求内 `custom_units` 互斥），定义落盘保存，**容器重建后仍可使用**
+- **活动别名（`GET`/`PUT /custom-unit-set-aliases`）**：为已发布的不可变定义集设置一个长期不变的**别名**：调用方始终沿用同一名称，维护者把别名切换到新发布的定义集。切换采用乐观并发（`expected_id`，初建为 `null`）：当前指向不一致返回 **409**、目标不存在返回 **422**，均不改写原指向；别名在请求开始时解析一次，三个接口可传 `custom_unit_set_alias`（与 `custom_units`、`custom_unit_set_id` 互斥），与定义集共同落盘，**容器重建后仍有效**
 - **统一 422**：维度不兼容、未知变量/符号、非法幂、除零、非法仿射用法、非线性方程、零系数、精度溢出均返回 422 且不产出结果
 
 ## 快速开始
@@ -56,8 +57,9 @@ pytest            # 运行测试
 | `value` | 十进制数/字符串 | 定值；建议用字符串传递以保证十进制精确性 |
 | `from`  | 字符串        | 源单位表达式                               |
 | `to`    | 字符串        | 目标单位表达式                             |
-| `custom_units` | 数组（可省略） | 1～6 项请求级自定义单位声明，详见下文；与 `custom_unit_set_id` 互斥 |
-| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识，详见下文；不存在返回 422；与 `custom_units` 互斥 |
+| `custom_units` | 数组（可省略） | 1～6 项请求级自定义单位声明，详见下文；与 `custom_unit_set_id`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识，详见下文；不存在返回 422；与 `custom_units`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_alias` | 字符串（可省略） | 已发布定义集的活动别名，详见下文；请求开始解析一次，别名不存在返回 422；与 `custom_units`、`custom_unit_set_id` 互斥 |
 
 成功响应 `200`：
 
@@ -254,14 +256,11 @@ curl -X POST http://localhost:8000/solve \
 # -> {"value": "0.9144", "unit": "m", "dimension": "m"}
 ```
 
-**选用规则**：
-
-| 请求中的字段                         | 行为                                                             |
-| ------------------------------------ | ---------------------------------------------------------------- |
-| 只有 `custom_units`                  | 沿用请求级定义（原有行为，仅本次请求有效）                        |
-| 只有 `custom_unit_set_id`            | 按已发布定义集解析；**标识不存在整次请求返回 422**                |
-| 两者同时出现                         | **整次请求返回 422**（一次调用只能使用一种自定义单位来源）        |
-| 两者都不带                           | 三个接口保持原有行为与响应，不使用任何自定义单位                  |
+**选用规则**：`custom_units` 与 `custom_unit_set_id` 互斥，同时出现整次请求
+返回 422；二者都缺省时三个接口保持原有行为（三种来源 `custom_units` /
+`custom_unit_set_id` / `custom_unit_set_alias` 的完整选用规则见下文
+[“为已发布定义集设置活动别名”](#为已发布定义集设置活动别名切换实际定义而不改调用方名称)
+一节）。
 
 - 不同定义集允许对**同名符号**给出不同含义；每次调用都构造独立的解析上下文，
   并发调用互不污染，也不会改写全局单位表；
@@ -270,6 +269,132 @@ curl -X POST http://localhost:8000/solve \
   **容器重建/进程重启后已发布的定义集仍可使用**；
 - 示例：发布一组长度定义后把服务停掉再 `docker compose up`，原 `id` 依然可用于换算；
   重启后还可继续发布新定义集，旧定义不受影响。
+
+### 为已发布定义集设置活动别名（切换实际定义而不改调用方名称）
+
+已发布的定义集**不可变**：要修正定义，只能再发布一份新定义集并拿到一个**新标识**。
+为了让调用方无需修改请求中的名称，服务支持在不可变定义集之上建立**活动别名**：
+调用方始终传同一个 `custom_unit_set_alias`，维护者通过切换接口改变别名实际指向的
+定义集标识。
+
+**查询别名**：
+
+```bash
+# 全部别名及其当前指向（按别名排序）
+curl http://localhost:8000/custom-unit-set-aliases
+# {"aliases":[{"alias":"lengths","custom_unit_set_id":"cus_..."}]}
+
+# 单个别名（不存在返回 422）
+curl http://localhost:8000/custom-unit-set-aliases/lengths
+# {"alias":"lengths","custom_unit_set_id":"cus_82327f8def2025cf00cd703f12b95c8c"}
+```
+
+**创建/切换别名**（`PUT /custom-unit-set-aliases/{alias}`），请求体为
+`{"custom_unit_set_id", "expected_id"}`，采用**乐观并发**：
+
+- 仅当别名当前指向与 `expected_id` 一致时切换才生效；**初建别名时当前没有指向，
+  `expected_id` 必须为 `null`**；
+- 当前指向与 `expected_id` 不一致时返回 **409**（响应体中带回服务端 `current_id`，
+  可重新查询后重试），**不改写原指向**；
+- 目标定义集标识不存在（或别名名称非法）时返回 **422**，同样**不改变任何指向**；
+- 别名名称仅允许字母、数字、下划线与连字符，长度 1～64。
+
+```bash
+# 1) 发布第一版（不可变）并初建别名 lengths 指向它（expected_id 为 null）
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"ft","factor":"0.3048","base_unit":"m"}]}'
+# {"id":"cus_v1_id", ...}
+
+curl -X PUT http://localhost:8000/custom-unit-set-aliases/lengths \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_unit_set_id":"cus_v1_id","expected_id":null}'
+# 200 {"alias":"lengths","custom_unit_set_id":"cus_v1_id"}
+
+# 2) 调用方始终使用别名，无需知道背后的标识
+curl -X POST http://localhost:8000/convert \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"10","from":"ft","to":"m","custom_unit_set_alias":"lengths"}'
+# {"value":"3.048","unit":"m","dimension":"m"}
+
+# 3) 维护者发布修正后的第二版（旧版定义与标识保持不变）
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"ft","factor":"0.30480","base_unit":"m"}]}'
+# {"id":"cus_v2_id", ...}
+
+# 4) 携带“当前指向” cus_v1_id 作为 expected_id 完成切换；
+#    若期间已被别人切换（当前不再是 cus_v1_id），本次返回 409 且不生效
+curl -X PUT http://localhost:8000/custom-unit-set-aliases/lengths \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_unit_set_id":"cus_v2_id","expected_id":"cus_v1_id"}'
+# 200 {"alias":"lengths","custom_unit_set_id":"cus_v2_id"}
+```
+
+冲突与非法目标示例：
+
+```bash
+# expected_id 与当前指向不一致 -> 409，原指向不变
+PUT /custom-unit-set-aliases/lengths
+{"custom_unit_set_id":"cus_v3_id","expected_id":"cus_v1_id"}
+# 409 {"detail":{"error":"alias_conflict",
+#       "message":"别名 'lengths' 当前指向与 expected_id 不一致：……",
+#       "current_id":"cus_v2_id"}}
+
+# 目标定义集不存在 -> 422，原指向不变
+PUT /custom-unit-set-aliases/lengths
+{"custom_unit_set_id":"cus_does_not_exist","expected_id":"cus_v2_id"}
+# 422 {"detail":{"error":"invalid_request","message":"别名 'lengths' 无法绑定到不存在的定义集: ……"}}
+```
+
+**用别名调用三个计算接口**：在 `/convert`、`/evaluate`、`/solve` 请求体中传
+`custom_unit_set_alias` 即可。别名在**请求开始时解析一次**，本次请求的源、目标与
+变量单位始终使用解析到的那一版定义；即使别名在请求处理过程中被切换，本次请求也会
+**完整使用旧版或新版**，不会跨版本混用。别名不存在整次请求返回 **422**。
+
+```bash
+# /evaluate
+curl -X POST http://localhost:8000/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"n": {"value": "10", "unit": "ft"}, "w": {"value": "2", "unit": "ft"}},
+    "formula": "n*w",
+    "output_unit": "ft^2",
+    "custom_unit_set_alias": "lengths"
+  }'
+# -> {"value": "20", "unit": "ft^2", "dimension": "m^2"}
+
+# /solve
+curl -X POST http://localhost:8000/solve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"a": {"value": "3", "unit": "ft"}},
+    "equation": "x = a",
+    "solve_for": "x",
+    "output_unit": "m",
+    "custom_unit_set_alias": "lengths"
+  }'
+# -> {"value": "0.9144", "unit": "m", "dimension": "m"}
+```
+
+**别名规则**：
+
+| 请求中的字段                         | 行为                                                             |
+| ------------------------------------ | ---------------------------------------------------------------- |
+| 只有 `custom_units`                  | 沿用请求级定义（原有行为，仅本次请求有效）                        |
+| 只有 `custom_unit_set_id`            | 直接按该已发布定义集解析（原有行为）；标识不存在返回 422          |
+| 只有 `custom_unit_set_alias`         | 请求开始解析一次别名并全程使用该版定义；**别名不存在返回 422**    |
+| 三者中任意两个（或三个）同时出现     | **整次请求返回 422**（一次调用只能使用一种自定义单位来源）        |
+| 三者都不带                           | 三个接口保持原有行为与响应，不使用任何自定义单位                  |
+
+- 切换别名与落盘**共同生效**：内存指向更新与 JSON 原子写盘在同一临界区完成，
+  写盘失败会回滚进程内指向（不改变原指向）后返回错误；
+- 别名与定义集保存在同一个 `custom_unit_sets.json` 中，命名卷挂载方式不变，
+  **容器重建/进程重启后别名仍然有效**；更早版本写出的、没有别名字段的旧文件
+  也能正常加载（按空别名处理，原定义集照常可用）；
+- 别名只是不可变定义集之上的一层引用：旧标识含义永不改变，切换别名不影响任何
+  直接使用 `custom_unit_set_id` 的调用；不选别名（也不带其他自定义来源）的
+  请求行为与以前完全一致。
 
 ### `POST /evaluate`
 
@@ -282,8 +407,9 @@ curl -X POST http://localhost:8000/solve \
 | `variables`   | 对象   | 1～20 个变量映射；键为变量名，值为 `{"value", "unit"}`      |
 | `formula`     | 字符串 | 求值公式（见下文语法）                                      |
 | `output_unit` | 字符串 | 结果目标单位表达式                                          |
-| `custom_units`| 数组（可省略） | 1～6 项请求级自定义单位声明，详见上文；与 `custom_unit_set_id` 互斥 |
-| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识；不存在返回 422；与 `custom_units` 互斥 |
+| `custom_units`| 数组（可省略） | 1～6 项请求级自定义单位声明，详见上文；与 `custom_unit_set_id`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识；不存在返回 422；与 `custom_units`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_alias` | 字符串（可省略） | 已发布定义集的活动别名；请求开始解析一次，别名不存在返回 422；与 `custom_units`、`custom_unit_set_id` 互斥 |
 
 变量名须以字母或下划线开头，仅含字母、数字、下划线（≤32 字符）；
 `value` 同样建议以 JSON 字符串传递以保证十进制精确性。成功响应与 `/convert` 相同。
@@ -358,8 +484,9 @@ curl -X POST http://localhost:8000/evaluate \
 | `equation`    | 字符串 | 含**恰好一个等号**的等式，两侧语法同 `/evaluate` 的公式      |
 | `solve_for`   | 字符串 | 待解未知量的名称（不得出现在 `variables` 中）                |
 | `output_unit` | 字符串 | 结果目标单位表达式，**须为线性单位**（不能是 `degC`/`degF`） |
-| `custom_units`| 数组（可省略） | 1～6 项请求级自定义单位声明，详见上文；与 `custom_unit_set_id` 互斥 |
-| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识；不存在返回 422；与 `custom_units` 互斥 |
+| `custom_units`| 数组（可省略） | 1～6 项请求级自定义单位声明，详见上文；与 `custom_unit_set_id`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_id` | 字符串（可省略） | 已发布自定义单位定义集标识；不存在返回 422；与 `custom_units`、`custom_unit_set_alias` 互斥 |
+| `custom_unit_set_alias` | 字符串（可省略） | 已发布定义集的活动别名；请求开始解析一次，别名不存在返回 422；与 `custom_units`、`custom_unit_set_id` 互斥 |
 
 成功响应与 `/convert` 相同（`value`/`unit`/`dimension`）。
 
@@ -429,6 +556,9 @@ curl -X POST http://localhost:8000/solve \
 | 端点         | 说明                             |
 | ------------ | -------------------------------- |
 | `POST /custom-unit-sets` | 发布 1～6 项自定义单位定义为可复用定义集，返回服务生成标识（201） |
+| `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
+| `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |
+| `PUT /custom-unit-set-aliases/{alias}` | 创建/切换活动别名（乐观并发：`expected_id` 初建为 `null`）；成功 200，冲突 409，目标不存在 422 |
 | `GET /units` | 列出全部单位、词头与别名         |
 | `GET /health`| 健康检查                         |
 | `GET /`      | 服务信息                         |
@@ -495,13 +625,14 @@ PRIMARY:= "(" expr ")" | VARIABLE | DECIMAL
 - 输入 `value`（及公式中的十进制定值）的有效数字同样不得超过 50 位
 - 可通过环境变量调整：`UNIT_API_MAX_PRECISION`（默认 50）、`UNIT_API_MAX_POWER`（默认 99）
 
-## 错误码（均为 HTTP 422）
+## 错误码
 
-响应体统一为 `{"detail": {"error": "<错误码>", "message": "<说明>"}}`：
+换算类错误响应体统一为 `{"detail": {"error": "<错误码>", "message": "<说明>"}}`，
+**均为 HTTP 422**：
 
 | 错误码               | 含义                                   |
 | -------------------- | -------------------------------------- |
-| `invalid_request`    | 请求参数校验失败（缺字段、值非法等；自定义单位的重名/符号冲突/循环引用/非法比例/禁引温标，以及 `custom_units` 与 `custom_unit_set_id` 同时出现、引用的定义集标识不存在也归入此码）   |
+| `invalid_request`    | 请求参数校验失败（缺字段、值非法等；自定义单位的重名/符号冲突/循环引用/非法比例/禁引温标，以及 `custom_units`、`custom_unit_set_id`、`custom_unit_set_alias` 任意两个同时出现、引用的定义集标识或活动别名不存在、别名绑定的目标定义集不存在也归入此码）   |
 | `invalid_syntax`     | 表达式/公式语法错误（含隐式相乘）      |
 | `unknown_symbol`     | 未知单位符号（含自定义单位的 `base_unit` 引用了未声明符号） |
 | `unknown_variable`   | 公式引用了未在变量映射中提供的变量     |
@@ -513,20 +644,32 @@ PRIMARY:= "(" expr ")" | VARIABLE | DECIMAL
 | `no_unique_solution` | 未知量系数为零：方程无解或有无穷多解   |
 | `precision_overflow` | 结果不是有限十进制或超过精度上限       |
 
+**唯一的非 422 领域状态**：`PUT /custom-unit-set-aliases/{alias}` 在别名当前指向
+与提交的 `expected_id` 不一致时返回 **HTTP 409**：
+
+```json
+{"detail": {"error": "alias_conflict",
+            "message": "别名 'lengths' 当前指向与 expected_id 不一致：……",
+            "current_id": "cus_..."}}
+```
+
+`current_id` 为服务端当前指向（初建冲突、当前没有指向时省略该字段）。冲突时不切换、
+不落盘、不改写原指向；调用方可按 `current_id` 重新读取后决定是否重试。
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 应用、路由与异常处理
+  main.py       # FastAPI 应用、路由与异常处理（含别名 409）
   schemas.py    # Pydantic 请求/响应模型
   parser.py     # 单位表达式解析器（递归下降）与规范化输出
   evaluator.py  # 公式求值器（Fraction 数值/量纲合并、温标规则）
   solver.py     # 等式求解器（未知量一次系数/常数的 Fraction 构建与量纲校验）
   units.py      # 单位注册表、SI 词头与别名
-  custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析
-  unit_sets.py  # 已发布定义集：校验发布、标识生成、线程安全与 JSON 落盘/重载
+  custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析，三种来源选择
+  unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、线程安全与 JSON 落盘/重载
   converter.py  # 量纲校验、仿射规则与精确十进制换算
-  errors.py     # 领域错误（统一映射 422）
+  errors.py     # 领域错误（换算类统一映射 422；别名冲突 AliasConflictError 映射 409）
   config.py     # 精度/幂次上限/数据目录配置
 tests/
   test_api.py       # /convert 端到端测试
@@ -534,6 +677,7 @@ tests/
   test_solve.py     # /solve 端到端测试
   test_custom_units.py  # 请求级自定义单位（三个接口）端到端测试
   test_unit_sets.py     # 可复用定义集发布/选用/互斥/隔离/不可变/持久化测试
+  test_unit_set_aliases.py  # 活动别名查询/切换（409/422）/三接口选用/并发一致性/持久化与旧文件兼容测试
 Dockerfile
-docker-compose.yml  # 命名卷 unit_sets_data -> /data，持久化已发布定义集
+docker-compose.yml  # 命名卷 unit_sets_data -> /data，持久化已发布定义集与活动别名
 ```

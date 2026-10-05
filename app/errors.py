@@ -1,8 +1,11 @@
 """领域错误定义。
 
-所有领域错误最终都以 HTTP 422 返回，响应体为::
+换算类领域错误最终都以 HTTP 422 返回，响应体为::
 
     {"detail": {"error": "<错误码>", "message": "<人类可读信息>"}}
+
+别名（active alias）的乐观切换在“当前指向与 expected_id 不一致”时以
+HTTP 409 返回 :class:`AliasConflictError`，同样不改变任何指向。
 """
 
 from __future__ import annotations
@@ -15,6 +18,24 @@ class ConversionError(Exception):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+class AliasConflictError(Exception):
+    """别名切换冲突：当前指向与提交的 expected_id 不一致（HTTP 409）。
+
+    此时既不切换别名指向，也不改变任何已发布定义集；响应体可携带服务端
+    当前指向 ``current_id``，供调用方重新读取后重试。
+    """
+
+    def __init__(self, alias: str, current_id: str | None, expected_id: str | None) -> None:
+        self.alias = alias
+        self.current_id = current_id
+        self.expected_id = expected_id
+        self.message = (
+            f"别名 {alias!r} 当前指向与 expected_id 不一致："
+            f"当前为 {current_id!r}，提交的 expected_id 为 {expected_id!r}"
+        )
+        super().__init__(self.message)
 
 
 def invalid_syntax(message: str) -> ConversionError:
